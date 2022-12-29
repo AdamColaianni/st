@@ -63,7 +63,7 @@ typedef struct {
 /* X modifiers */
 #define XK_ANY_MOD    UINT_MAX
 #define XK_NO_MOD     0
-#define XK_SWITCH_MOD (1<<13|1<<14)
+#define XK_SWITCH_MOD (1<<13)
 
 /* function definitions used in config.h */
 static void clipcopy(const Arg *);
@@ -173,16 +173,15 @@ static void xresize(int, int);
 static void xhints(void);
 static int xloadcolor(int, const char *, Color *);
 static int xloadfont(Font *, FcPattern *);
+static void xloadfonts(char *, double);
 static int xloadsparefont(FcPattern *, int);
 static void xloadsparefonts(void);
-static void xloadfonts(const char *, double);
 static void xunloadfont(Font *);
 static void xunloadfonts(void);
 static void xsetenv(void);
 static void xseturgency(int);
 static int evcol(XEvent *);
 static int evrow(XEvent *);
-static float clamp(float, float, float);
 
 static void expose(XEvent *);
 static void visibility(XEvent *);
@@ -273,10 +272,7 @@ static char *opt_line  = NULL;
 static char *opt_name  = NULL;
 static char *opt_title = NULL;
 
-static int focused = 0;
-
 static int oldbutton = 3; /* button event on startup: 3 = release */
-static uint buttons; /* bit field of pressed buttons */
 
 void
 clipcopy(const Arg *dummy)
@@ -321,8 +317,10 @@ changealpha(const Arg *arg)
 {
     if((alpha > 0 && arg->f < 0) || (alpha < 1 && arg->f > 0))
         alpha += arg->f;
-    alpha = clamp(alpha, 0.0, 1.0);
-    alphaUnfocus = clamp(alpha-alphaOffset, 0.0, 1.0);
+    if(alpha < 0)
+        alpha = 0;
+    if(alpha > 1)
+        alpha = 1;
 
     xloadcols();
     redraw();
@@ -379,15 +377,6 @@ evrow(XEvent *e)
 	int y = e->xbutton.y - borderpx;
 	LIMIT(y, 0, win.th - 1);
 	return y / win.ch;
-}
-
-float
-clamp(float value, float lower, float upper) {
-    if(value < lower)
-        return lower;
-    if(value > upper)
-        return upper;
-    return value;
 }
 
 void
@@ -459,7 +448,7 @@ mousereport(XEvent *e)
 	if (IS_SET(MODE_MOUSESGR)) {
 		len = snprintf(buf, sizeof(buf), "\033[<%d;%d;%d%c",
 				button, x+1, y+1,
-				e->type == ButtonRelease ? 'm' : 'M');
+				e->xbutton.type == ButtonRelease ? 'm' : 'M');
 	} else if (x < 223 && y < 223) {
 		len = snprintf(buf, sizeof(buf), "\033[M%c%c%c",
 				32+button, 32+x+1, 32+y+1);
@@ -505,12 +494,8 @@ mouseaction(XEvent *e, uint release)
 void
 bpress(XEvent *e)
 {
-	int btn = e->xbutton.button;
 	struct timespec now;
 	int snap;
-
-	if (1 <= btn && btn <= 11)
-		buttons |= 1 << (btn-1);
 
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
@@ -520,7 +505,7 @@ bpress(XEvent *e)
 	if (mouseaction(e, 0))
 		return;
 
-	if (btn == Button1) {
+	if (e->xbutton.button == Button1) {
 		/*
 		 * If the user clicks below predefined timeouts specific
 		 * snapping behaviour is exposed.
@@ -734,11 +719,6 @@ xsetsel(char *str)
 void
 brelease(XEvent *e)
 {
-	int btn = e->xbutton.button;
-
-	if (1 <= btn && btn <= 11)
-		buttons &= ~(1 << (btn-1));
-
 	if (IS_SET(MODE_MOUSE) && !(e->xbutton.state & forcemousemod)) {
 		mousereport(e);
 		return;
@@ -746,7 +726,7 @@ brelease(XEvent *e)
 
 	if (mouseaction(e, 1))
 		return;
-	if (btn == Button1)
+	if (e->xbutton.button == Button1)
 		mousesel(e, 1);
 }
 
@@ -828,28 +808,21 @@ xloadcolor(int i, const char *name, Color *ncolor)
 }
 
 void
-xloadalpha(void)
-{
-	float const usedAlpha = focused ? alpha : alphaUnfocus;
-	if (opt_alpha) alpha = strtof(opt_alpha, NULL);
-	dc.col[defaultbg].color.alpha = (unsigned short)(0xffff * usedAlpha);
-	dc.col[defaultbg].pixel &= 0x00FFFFFF;
-	dc.col[defaultbg].pixel |= (unsigned char)(0xff * usedAlpha) << 24;
-}
-
-void
 xloadcols(void)
 {
 	int i;
 	static int loaded;
 	Color *cp;
 
-	if (!loaded) {
-		dc.collen = 1 + (defaultbg = MAX(LEN(colorname), 256));
+	if (loaded) {
+		for (cp = dc.col; cp < &dc.col[dc.collen]; ++cp)
+			XftColorFree(xw.dpy, xw.vis, xw.cmap, cp);
+	} else {
+		dc.collen = MAX(LEN(colorname), 256);
 		dc.col = xmalloc(dc.collen * sizeof(Color));
 	}
 
-	for (i = 0; i+1 < dc.collen; i++)
+	for (i = 0; i < dc.collen; i++)
 		if (!xloadcolor(i, NULL, &dc.col[i])) {
 			if (colorname[i])
 				die("could not allocate color '%s'\n", colorname[i]);
@@ -857,24 +830,13 @@ xloadcols(void)
 				die("could not allocate color %d\n", i);
 		}
 
-	if (dc.collen) // cannot die, as the color is already loaded.
-		xloadcolor(background, NULL, &dc.col[defaultbg]);
-
-	xloadalpha();
+	/* set alpha value of bg color */
+	if (opt_alpha)
+		alpha = strtof(opt_alpha, NULL);
+	dc.col[defaultbg].color.alpha = (unsigned short)(0xffff * alpha);
+	dc.col[defaultbg].pixel &= 0x00FFFFFF;
+	dc.col[defaultbg].pixel |= (unsigned char)(0xff * alpha) << 24;
 	loaded = 1;
-}
-
-int
-xgetcolor(int x, unsigned char *r, unsigned char *g, unsigned char *b)
-{
-	if (!BETWEEN(x, 0, dc.collen))
-		return 1;
-
-	*r = dc.col[x].color.red >> 8;
-	*g = dc.col[x].color.green >> 8;
-	*b = dc.col[x].color.blue >> 8;
-
-	return 0;
 }
 
 int
@@ -1030,7 +992,7 @@ xloadfont(Font *f, FcPattern *pattern)
 }
 
 void
-xloadfonts(const char *fontstr, double fontsize)
+xloadfonts(char *fontstr, double fontsize)
 {
 	FcPattern *pattern;
 	double fontval;
@@ -1038,7 +1000,7 @@ xloadfonts(const char *fontstr, double fontsize)
 	if (fontstr[0] == '-')
 		pattern = XftXlfdParse(fontstr, False, False);
 	else
-		pattern = FcNameParse((const FcChar8 *)fontstr);
+		pattern = FcNameParse((FcChar8 *)fontstr);
 
 	if (!pattern)
 		die("can't open font %s\n", fontstr);
@@ -1664,11 +1626,11 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 	/* Render underline and strikethrough. */
 	if (base.mode & ATTR_UNDERLINE) {
 		XftDrawRect(xw.draw, fg, winx, winy + dc.font.ascent + 1,
-                width, 1);
+				width, 1);
 	}
 
 	if (base.mode & ATTR_STRUCK) {
-		XftDrawRect(xw.draw, fg, winx, winy + 2 * dc.font.ascent * chscale / 3,
+		XftDrawRect(xw.draw, fg, winx, winy + 2 * dc.font.ascent / 3,
 				width, 1);
 	}
 
@@ -1790,9 +1752,8 @@ xseticontitle(char *p)
 	XTextProperty prop;
 	DEFAULT(p, opt_title);
 
-	if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
-	                                &prop) != Success)
-		return;
+	Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
+			&prop);
 	XSetWMIconName(xw.dpy, xw.win, &prop);
 	XSetTextProperty(xw.dpy, xw.win, &prop, xw.netwmiconname);
 	XFree(prop.value);
@@ -1804,9 +1765,8 @@ xsettitle(char *p)
 	XTextProperty prop;
 	DEFAULT(p, opt_title);
 
-	if (Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
-	                                &prop) != Success)
-		return;
+	Xutf8TextListToTextProperty(xw.dpy, &p, 1, XUTF8StringStyle,
+			&prop);
 	XSetWMName(xw.dpy, xw.win, &prop);
 	XSetTextProperty(xw.dpy, xw.win, &prop, xw.netwmname);
 	XFree(prop.value);
@@ -1950,22 +1910,12 @@ focus(XEvent *ev)
 		xseturgency(0);
 		if (IS_SET(MODE_FOCUS))
 			ttywrite("\033[I", 3, 0);
-		if (!focused) {
-			focused = 1;
-			xloadcols();
-			tfulldirt();
-		}
 	} else {
 		if (xw.ime.xic)
 			XUnsetICFocus(xw.ime.xic);
 		win.mode &= ~MODE_FOCUSED;
 		if (IS_SET(MODE_FOCUS))
 			ttywrite("\033[O", 3, 0);
-		if (focused) {
-			focused = 0;
-			xloadcols();
-			tfulldirt();
-		}
 	}
 }
 
@@ -2017,10 +1967,8 @@ kpress(XEvent *ev)
 {
 	XKeyEvent *e = &ev->xkey;
 	KeySym ksym;
-	char *buf = NULL, *customkey;
-	int len = 0;
-	int buf_size = 64;
-	int critical = - 1;
+	char buf[64], *customkey;
+	int len;
 	Rune c;
 	Status status;
 	Shortcut *bp;
@@ -2028,44 +1976,27 @@ kpress(XEvent *ev)
 	if (IS_SET(MODE_KBDLOCK))
 		return;
 
-reallocbuf:
-	if (critical > 0)
-		goto cleanup;
-	if (buf)
-		free(buf);
-
-	buf = xmalloc((buf_size) * sizeof(char));
-	critical += 1;
-
-	if (xw.ime.xic) {
-		len = XmbLookupString(xw.ime.xic, e, buf, buf_size, &ksym, &status);
-		if (status == XBufferOverflow) {
-			buf_size = len;
-			goto reallocbuf;
-		}
-	} else {
-		// Not sure how to fix this and if it is fixable
-		// but at least it does write something into the buffer
-		// so it is not as critical
-		len = XLookupString(e, buf, buf_size, &ksym, NULL);
-	}
+	if (xw.ime.xic)
+		len = XmbLookupString(xw.ime.xic, e, buf, sizeof buf, &ksym, &status);
+	else
+		len = XLookupString(e, buf, sizeof buf, &ksym, NULL);
 	/* 1. shortcuts */
 	for (bp = shortcuts; bp < shortcuts + LEN(shortcuts); bp++) {
 		if (ksym == bp->keysym && match(bp->mod, e->state)) {
 			bp->func(&(bp->arg));
-			goto cleanup;
+			return;
 		}
 	}
 
 	/* 2. custom keys from config.h */
 	if ((customkey = kmap(ksym, e->state))) {
 		ttywrite(customkey, strlen(customkey), 1);
-		goto cleanup;
+		return;
 	}
 
 	/* 3. composed string from input method */
 	if (len == 0)
-		goto cleanup;
+		return;
 	if (len == 1 && e->state & Mod1Mask) {
 		if (IS_SET(MODE_8BIT)) {
 			if (*buf < 0177) {
@@ -2078,11 +2009,7 @@ reallocbuf:
 			len = 2;
 		}
 	}
-	if (len <= buf_size)
-		ttywrite(buf, len, 1);
-cleanup:
-	if (buf)
-		free(buf);
+	ttywrite(buf, len, 1);
 }
 
 void
@@ -2353,8 +2280,6 @@ run:
 	config_init();
 	cols = MAX(cols, 1);
 	rows = MAX(rows, 1);
-	defaultbg = MAX(LEN(colorname), 256);
-	alphaUnfocus = alpha-alphaOffset;
 	tnew(cols, rows);
 	xinit(cols, rows);
 	xsetenv();
@@ -2363,4 +2288,3 @@ run:
 
 	return 0;
 }
-
